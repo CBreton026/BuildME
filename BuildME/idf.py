@@ -127,14 +127,18 @@ def get_surfaces(idf, energy_standard, res_scenario):
     # flatten the list
     total_no_surfaces = [item for sublist in total_no_surfaces for item in sublist]
     surfaces['ext_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Wall'])
-    surfaces['int_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Wall'])
+    surfaces['int_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Wall']) + \
+                           extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Wall'])
     surfaces['door'] = extract_doors(idf) + extract_surfaces(idf, ['FenestrationSurface:Detailed'], [''], ['Door'])
     surfaces['window'] = extract_windows(idf) + extract_surfaces(idf, ['FenestrationSurface:Detailed'], [''], ['Window'])
     surfaces['int_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Adiabatic'], ['Floor']) + \
                                 extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Floor'])
-    surfaces['int_ceiling'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Ceiling'])
+    surfaces['int_ceiling'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Ceiling']) + \
+                              extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Adiabatic'], ['Ceiling'])
     surfaces['basement_ext_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                     ['GroundBasementPreprocessorAverageWall'], ['Wall'])
+                                                     ['GroundBasementPreprocessorAverageWall'], ['Wall']) + \
+                                    extract_surfaces(idf, ['BuildingSurface:Detailed'],
+                                                     ['GroundFCfactorMethod'], ['Wall'])
     surfaces['basement_int_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Floor'])
     surfaces['ext_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Ground'], ['Floor']) + \
                             extract_surfaces(idf, ['BuildingSurface:Detailed'], ['GroundSlabPreprocessorAverage'],
@@ -160,27 +164,6 @@ def get_surfaces(idf, energy_standard, res_scenario):
     return surfaces
 
 
-def extract_surfaces_zone_multiplier(list_surfaces, element_type, boundary, surface_type):
-    """
-    Function to extract the surfaces if a zone multiplier is used. Can't use the idf file and need to use a list
-    of surfaces instead.
-    :param list_surfaces: list of all surfaces
-    :param element_type: BuildingSurface:Detailed or FenestrationSurface:Detailed
-    :param boundary: Outdoors, Grounds etc.
-    :param surface_type: Wall, Window etc.
-    """
-    surfaces = []
-    for e in element_type:
-        for s in list_surfaces:
-            if s.Surface_Type != 'Window':
-                if s.Outside_Boundary_Condition in boundary and s.Surface_Type in surface_type:
-                    surfaces.append(s)
-            else:
-                if s.Outside_Boundary_Condition_Object in boundary and s.Surface_Type in surface_type:
-                    surfaces.append(s)
-    return surfaces
-
-
 def get_surfaces_with_zone_multiplier(idf, energy_standard, res_scenario):
     """
     Function to extract surfaces for RT, as zone multiplier is used and windows are modeled in the FenestrationSurface:Detailed object.
@@ -200,8 +183,8 @@ def get_surfaces_with_zone_multiplier(idf, energy_standard, res_scenario):
     surfaces_idf = [item for sublist in surfaces_idf for item in sublist]
 
     # Finding the multiplier used
-    list_of_multipliers = [x.Multiplier for x in idf.idfobjects["ZONE"] if x.Multiplier is not '']
-    zones_multipliers = [x.Name for x in idf.idfobjects["ZONE"] if x.Multiplier is not '']
+    list_of_multipliers = [x.Multiplier for x in idf.idfobjects["ZONE"] if x.Multiplier != '']
+    zones_multipliers = [x.Name for x in idf.idfobjects["ZONE"] if x.Multiplier != '']
     multipliers = dict(zip(zones_multipliers,list_of_multipliers))
 
     # Need to account for zone multiplier
