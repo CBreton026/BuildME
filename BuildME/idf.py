@@ -18,6 +18,7 @@ class SurrogateElement:
     A surrogate class for windows and doors, because e.g. idf.idfobjects['Window'.upper()] does not contain an 'area'
     attribute. See also https://github.com/santoshphilip/eppy/issues/230.
     """
+
     def __init__(self, g):
         if type(g) == dict:
             self.area = g['area']
@@ -25,12 +26,19 @@ class SurrogateElement:
             self.Construction_Name = g['Construction_Name']
             self.key = g['key']
             self.Name = g['Name']
+            self.fieldnames = [g.keys()]
+
         else:
             self.area = g.Length * g.Height
             self.Building_Surface_Name = g.Building_Surface_Name
             self.Construction_Name = g.Construction_Name
             self.key = g.key
             self.Name = g.Name
+            self.fieldnames = g.fieldnames
+            # See EnergyPlus idd file: the surface multiplier for fenestrationsurface:detailed,
+            # door, glazed door, window is truncated to integer.
+            self.Multiplier = int(g.Multiplier)
+
             # self.Outside_Boundary_Condition = g.Outside_Boundary_Condition
             # self.Zone_Name = g.Zone_Name
             # self.Surface_Type = g.Surface_Type
@@ -42,6 +50,7 @@ class SurrogateMaterial:
     A surrogate class for materials, such as, because some material types (e.g. 'Material:NoMass') do not contain
     certain attributes that are later required (e.g. 'Density').
     """
+
     def __init__(self, g):
         self.key = g.key
         self.Name = g.Name
@@ -146,6 +155,7 @@ def get_surfaces(idf, energy_standard, res_scenario):
                             extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Floor'])
     surfaces['ceiling_roof'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Ceiling'])
     surfaces['roof'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Roof'])
+
     # Check what surfaces are present in `total_no_surfaces` but were missed in `surfaces`
     check = [s.Name for s in total_no_surfaces if s.Name not in [n.Name for n in flatten_surfaces(surfaces)]]
     assert len(check) == 0, "Following elements are not accounted for: %s" % check
