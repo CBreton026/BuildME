@@ -4,16 +4,17 @@ Functions to manipulate the IDF files.
 Copyright: Niko Heeren, 2019
 """
 import collections
-import os
-
+import logging
 import pandas as pd
 import numpy as np
 from eppy.modeleditor import IDF
-
+from collections import defaultdict
 from BuildME import settings
 
 
 class SurrogateElement:
+    # TODO(cbreton026): Make SurrogateElement inherit from dict?
+    # see: https://treyhunner.com/2019/04/why-you-shouldnt-inherit-from-list-and-dict-in-python/
     """
     A surrogate class for windows and doors, because e.g. idf.idfobjects['Window'.upper()] does not contain an 'area'
     attribute. See also https://github.com/santoshphilip/eppy/issues/230.
@@ -43,18 +44,22 @@ class SurrogateElement:
             # self.Zone_Name = g.Zone_Name
             # self.Surface_Type = g.Surface_Type
 
+    def __repr__(self):
+        return (f"{self.key}: {self.Name} \n"
+                f"fieldnames: {self.fieldnames}")
 
+
+""" FIXME(cbreton026: This is a 'soft' delete to see if this class is used anywhere)
 class SurrogateMaterial:
     # TODO: DELETE?
-    """
     A surrogate class for materials, such as, because some material types (e.g. 'Material:NoMass') do not contain
     certain attributes that are later required (e.g. 'Density').
-    """
 
     def __init__(self, g):
         self.key = g.key
         self.Name = g.Name
         self.Density = None
+"""
 
 
 def extract_surfaces(idf, element_type, boundary, surface_type):
@@ -123,140 +128,72 @@ def read_idf(in_file):
 
 
 def get_surfaces(idf, energy_standard, res_scenario):
-    """
-    A function to derive all surfaces from the IDF file.
-
-    Source: https://unmethours.com/question/15574/how-to-list-and-measure-area-surfaces/?answer=15604#post-id-15604
-    NB: The post also explains a method to calculate the external areas by orientation (not implemented here).
-    :return: A dictionary for each surface type, e.g. {'ext_wall': [..., ...], 'roof': [...]}
-    """
-    surfaces = {}
-    surfaces_to_count = ['Window', 'BuildingSurface:Detailed', 'Door']
-    total_no_surfaces = [[s for s in idf.idfobjects[st.upper()]] for st in surfaces_to_count]
-    # flatten the list
-    total_no_surfaces = [item for sublist in total_no_surfaces for item in sublist]
-    surfaces['ext_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Wall'])
-    surfaces['int_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Wall']) + \
-                           extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Wall'])
-    surfaces['door'] = extract_doors(idf) + extract_surfaces(idf, ['FenestrationSurface:Detailed'], [''], ['Door'])
-    surfaces['window'] = extract_windows(idf) + extract_surfaces(idf, ['FenestrationSurface:Detailed'], [''], ['Window'])
-    surfaces['int_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Adiabatic'], ['Floor']) + \
-                                extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Floor'])
-    surfaces['int_ceiling'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Surface'], ['Ceiling']) + \
-                              extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Adiabatic'], ['Ceiling'])
-    surfaces['basement_ext_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                     ['GroundBasementPreprocessorAverageWall'], ['Wall']) + \
-                                    extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                     ['GroundFCfactorMethod'], ['Wall'])
-    surfaces['basement_int_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Floor'])
-    surfaces['ext_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Ground'], ['Floor']) + \
-                            extract_surfaces(idf, ['BuildingSurface:Detailed'], ['GroundSlabPreprocessorAverage'],
-                                             ['Floor']) + \
-                            extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Floor'])
-    surfaces['ceiling_roof'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Zone'], ['Ceiling'])
-    surfaces['roof'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'], ['Roof'])
-
-    # Check what surfaces are present in `total_no_surfaces` but were missed in `surfaces`
-    check = [s.Name for s in total_no_surfaces if s.Name not in [n.Name for n in flatten_surfaces(surfaces)]]
-    assert len(check) == 0, "Following elements are not accounted for: %s" % check
-    temp_surface_areas = calc_surface_areas(surfaces)
-    constr_list = {m.Name: m for m in read_constructions(idf)}
-    if 'attic-ceiling-' + energy_standard in [x for x in constr_list]:
-        print('adding interior walls... ')
-        int_wall_constr = constr_list['attic-ceiling-' + energy_standard].Name
-        surfaces['int_wall'] = surfaces['int_wall'] +\
-                           (create_surrogate_int_walls(temp_surface_areas['floor_area_wo_basement'], int_wall_constr))
-    if 'Surrogate_slab-' + res_scenario in [x for x in constr_list]:
-        print('adding basement... ')
-        slab_constr = constr_list['Surrogate_slab-' + res_scenario].Name
-        surfaces['slab'] = create_surrogate_slab(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['basement'] = create_surrogate_basement(temp_surface_areas['footprint_area'], slab_constr)
-    return surfaces
-
-
-def get_surfaces_with_zone_multiplier(idf, energy_standard, res_scenario):
-    """
-    Function to extract surfaces for RT, as zone multiplier is used and windows are modeled in the FenestrationSurface:Detailed object.
-    :param idf: The IDF file
-    :param energy_standard:
-    :param res_scenario:
-    :return: list of surfaces accounting for zone multipliers
-    """
     surfaces = {}
 
-    surfaces_to_count = ['FenestrationSurface:Detailed', 'BuildingSurface:Detailed']
+    # Define the surfaces to extract and their respective element_type, boundary and surface_type.
+    target_surfaces = surfaces_to_extract()
 
-    # Extracting all surfaces from idf file
-    surfaces_idf = [[s for s in idf.idfobjects[st.upper()]] for st in surfaces_to_count]
+    # Extract surfaces from the model
+    for key, value in target_surfaces.items():
+        surfaces.update({key: extract_surfaces(idf, value['element_type'], value['boundary'], value['surface_type'])})
 
-    # Flatten list
-    surfaces_idf = [item for sublist in surfaces_idf for item in sublist]
+    # Add some missed surfaces manually
+    # FIXME(cbreton026): Could/should this be in extract surfaces directly?
+    surfaces['door'].extend(extract_doors(idf))
+    surfaces['window'].extend(extract_windows(idf))
 
-    # Finding the multiplier used
-    list_of_multipliers = [x.Multiplier for x in idf.idfobjects["ZONE"] if x.Multiplier != '']
-    zones_multipliers = [x.Name for x in idf.idfobjects["ZONE"] if x.Multiplier != '']
-    multipliers = dict(zip(zones_multipliers,list_of_multipliers))
+    # Find out if there are surface multipliers applied to specific surfaces
+    # in the model, and apply them. # TODO(cbreton026): change the variable name
+    surfaces_with_s_multipliers = apply_surface_multipliers(surfaces)
+    if surfaces_with_s_multipliers:
+        logging.warning("There are surface multipliers in model %s: %s" % (str(idf.idfname), surfaces_with_s_multipliers))
 
-    # Need to account for zone multiplier
-    surfaces['ext_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                            ['Outdoors'], ['Wall'])
-    surfaces['int_wall'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                            ['Surface'], ['Wall'])
-    surfaces['window'] = extract_surfaces(idf, ['FenestrationSurface:Detailed'], [''],
-                                                          ['Window'])
-    surfaces['int_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                             ['Adiabatic'], ['Floor']) + \
-                            extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                             ['Surface'], ['Floor'])
-    surfaces['int_ceiling'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                               ['Surface'], ['Ceiling']) + \
-                              extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                               ['Adiabatic'], ['Ceiling'])
-    surfaces['ext_floor'] = extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                             ['Ground'], ['Floor']) + \
-                            extract_surfaces(idf, ['BuildingSurface:Detailed'],
-                                                             ['Outdoors'], ['Floor'])
-    surfaces['roof'] = extract_surfaces(idf, ['BuildingSurface:Detailed'], ['Outdoors'],
-                                                        ['Roof'])
-
-    for key in surfaces.keys():
-        temp_elem = []
-        for elem in surfaces[key]:
-            if elem.Surface_Type == 'Window':
-                surface_name = elem.Building_Surface_Name
-                for ext_wall_surface in surfaces['ext_wall']:
-                    if ext_wall_surface.Name == surface_name:
-                        zone_name = ext_wall_surface.Zone_Name
+        for key in surfaces_with_s_multipliers:
+            if key in surfaces:
+                logging.warning("adding multiplied surfaces for %s" % key)
+                surfaces[key].extend(surfaces_with_s_multipliers[key])
             else:
-                zone_name = elem.Zone_Name
+                logging.warning("Cannot add the multiplied surfaces for %s " % key)
 
-            if zone_name in multipliers.keys():
-                temp_elem.extend(np.repeat(elem, multipliers[zone_name] - 1).tolist())
-        surfaces[key].extend(temp_elem)
+    # Find out if there zone multipliers applied to specific zones in the model.
+    zone_multipliers = get_zone_multipliers(idf)
+    if zone_multipliers:
+        logging.warning("There are zone multipliers in model %s: %s" % (str(idf.idfname), zone_multipliers))
 
-    temp_surface_areas = calc_surface_areas(surfaces)
-    constr_list = {m.Name: m for m in read_constructions(idf)}
-    slab_constr = constr_list['Surrogate_slab-' + res_scenario].Name
+        # Apply zone multipliers to the surfaces, if there are any
+        multiplied_surfaces_to_add = apply_zone_multipliers(zone_multipliers, surfaces)
 
-    if res_scenario == 'RES2.1' or res_scenario == 'RES2.1+RES2.2':
-        floor_slab_constr = constr_list['Concrete_floor_slab-' + res_scenario].Name
-        surfaces['int_floor_second_floor'] = create_surrogate_slab(temp_surface_areas['footprint_area'], floor_slab_constr)
-        surfaces['basement'] = create_surrogate_basement(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['slab'] = create_surrogate_slab(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['basement1'] = create_surrogate_basement(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['slab1'] = create_surrogate_slab(temp_surface_areas['footprint_area'], slab_constr)
-    else:
-        surfaces['basement'] = create_surrogate_basement(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['basement1'] = create_surrogate_basement(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['slab'] = create_surrogate_slab(temp_surface_areas['footprint_area'], slab_constr)
-        surfaces['slab1'] = create_surrogate_slab(temp_surface_areas['footprint_area'], slab_constr)
+        for key in multiplied_surfaces_to_add:
+            if key in surfaces:
+                logging.warning("adding multiplied surfaces for %s" % key)
+                surfaces[key].extend(multiplied_surfaces_to_add[key])
+            else:
+                logging.warning("Cannot add the multiplied surfaces for %s " % key)
 
-    # Do not have to add surrogate internal walls as those are added already in the idf file, but shear walls
-    shear_constr = constr_list['Shear_wall-' + res_scenario].Name
-    surfaces['shear_wall'] = create_surrogate_shear_wall(temp_surface_areas['floor_area_wo_basement'], shear_constr)
-    if 'Shear_wall-' + res_scenario in [x for x in constr_list]:
-        shear_constr = constr_list['Shear_wall-' + res_scenario].Name
-        surfaces['shear_wall'] = create_surrogate_shear_wall(temp_surface_areas['floor_area_wo_basement'], shear_constr)
+    # Check for missed surfaces among relevant surfaces in the idf file.
+    # 'FenestrationSurface:Detailed' is included as it is required for RT, and
+    # including it does not affect calculations for other models.
+    surfaces_to_count = ['Window', 'FenestrationSurface:Detailed',
+                         'BuildingSurface:Detailed', 'Door']
+    missed_surfaces = check_missed_surfaces(idf, surfaces_to_count, surfaces)
+    if missed_surfaces:
+        logging.warning("Following elements are not accounted for: %s" % missed_surfaces)
+
+    # Add surrogate elements to the model
+    # TODO(cbreton026): can these new surrogate elements be affected by multipliers?
+    surrogate_elems = add_surrogate_elem(idf, surfaces, energy_standard, res_scenario)
+
+    if surrogate_elems:
+        logging.warning("Adding surrogate elements to the model.")
+
+        for key in surrogate_elems:
+            if key in surfaces:
+                logging.warning("adding surrogate elements to surfaces['%s']" % key)
+                surfaces[key].extend(surrogate_elems[key])
+            else:
+                logging.warning("adding a new surface and key for '%s'" % key)
+                surfaces[key] = surrogate_elems[key]
+
     return surfaces
 
 
@@ -313,7 +250,7 @@ def create_surrogate_shear_wall(floor_area, construction):
         'Name': 'surrogate_shear_wall',
         'Building_Surface_Name': None,
         'Construction_Name': construction,
-        'area': 0.24*floor_area
+        'area': 0.24 * floor_area
     }
     return [SurrogateElement(shear_walls)]
 
@@ -419,6 +356,8 @@ def read_constructions(idf):
     :param idf:
     :return:
     """
+    # TODO(cbreton026): sets are unordered, but have no duplicates. They might
+    # be useful to replace find_duplicates?
     constructions = idf.idfobjects['Construction'.upper()]
     find_duplicates(constructions)
     return constructions
@@ -426,11 +365,11 @@ def read_constructions(idf):
 
 def extract_layers(construction):
     res = {}
-    layers = ['Outside_Layer'] + ['Layer_'+str(i+2) for i in range(9)]
-    for l in layers:
-        if getattr(construction, l) == '':
+    layers = ['Outside_Layer'] + ['Layer_' + str(i + 2) for i in range(9)]
+    for layer in layers:
+        if getattr(construction, layer) == '':
             break  # first empty value found
-        res[l] = getattr(construction, l)
+        res[layer] = getattr(construction, layer)
     return res
 
 
@@ -448,3 +387,303 @@ def get_fenestration_objects_from_surface(idf, surface_obj):
         fenestration.extend(new)
     return fenestration
 
+
+def surfaces_to_extract():
+    # TODO(cbreton026): Eventually move this to a 'clean' version of settings.py
+    surfaces = {
+        'ext_wall':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Outdoors'],
+             'surface_type': ['Wall']
+             },
+        'int_wall':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Surface', 'Zone'],
+             'surface_type': ['Wall']
+             },
+        'basement_ext_wall':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['GroundBasementPreprocessorAverageWall', 'GroundFCfactorMethod'],
+             'surface_type': ['Wall']
+             },
+        'ext_floor':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Ground', 'GroundSlabPreprocessorAverage',
+                          'GroundFCfactorMethod', 'Outdoors'],
+             'surface_type': ['Floor']
+             },
+        'int_floor':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Adiabatic', 'Surface'],  # FIXME(@cbreton026): Remove 'Adiabatic'? See @shnkn #47
+             'surface_type': ['Floor']
+             },
+        'basement_int_floor':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Zone'],
+             'surface_type': ['Floor']
+             },
+        'int_ceiling':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Surface', 'Adiabatic'],
+             'surface_type': ['Ceiling']
+             },
+        'ceiling_roof':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Zone'],
+             'surface_type': ['Ceiling']},
+        'roof':
+            {'element_type': ['BuildingSurface:Detailed'],
+             'boundary': ['Outdoors'],
+             'surface_type': ['Roof']
+             },
+        'door':
+            {'element_type': ['FenestrationSurface:Detailed'],
+             'boundary': [''],
+             'surface_type': ['Door']
+             },
+        'window':
+            {'element_type': ['FenestrationSurface:Detailed'],
+             'boundary': [''],
+             'surface_type': ['Window', 'GlassDoor']
+             }
+    }
+    return surfaces
+
+
+def check_missed_surfaces(idf, surfaces_to_count, extracted_surfaces):
+    """Checks if get_surfaces missed relevant surfaces in the idf.
+
+    Args:
+        idf (file):
+            The idf file to scan.
+        surfaces_to_count (list):
+            A list of relevant surfaces to count in the
+            idf, e.g. ['Window', 'BuildingSurface:Detailed', 'Door'].
+        extracted_surfaces (dict):
+            A dictionnary containing the extracted surfaces from get_surfaces().
+
+    Returns:
+        missed_surfaces (list):
+            A list of the relevant surfaces that are present
+            in the idf file, but absent from the extracted_surfaces.
+    """
+    missed_surfaces = []
+
+    # Get total number of relevant surfaces in the idf.
+    total_no_surfaces = [[surface for surface in idf.idfobjects[surface_name.upper()]]
+                         for surface_name in surfaces_to_count]
+    total_no_surfaces = [item for sublist in total_no_surfaces for item in sublist]
+
+    # Identify any missed relevant surfaces in extracted_surfaces.
+    missed_surfaces = [surface.Name for surface in total_no_surfaces
+                       if surface.Name not in [extracted_surface.Name for extracted_surface
+                                               in flatten_surfaces(extracted_surfaces)]]
+    return missed_surfaces
+
+
+def apply_surface_multipliers(surfaces):
+    """Returns missing surfaces for all surface multipliers greater than 1 in the model.
+
+    Args:
+        surfaces (dict):
+            A dictionary of surfaces in the idf file, where the key is the
+            surface type, and the value is a list of surface objects. For example:
+                {'ext_wall': [EpBunch, EpBunch],
+                 'slab: [SurrogateElement],
+                 'int_wall: [EpBunch, EpBunch]'}
+
+    Returns:
+        multiplied_surfaces_to_add (dict):
+            a dict of multiplied surfaces that must be added to 'surfaces'.
+    """
+    multiplied_surfaces_to_add = {}
+
+    for surface_key in surfaces:
+        if not surfaces[surface_key]:
+            logging.warning("surface %s is empty - skipping it" % surface_key)
+            continue
+
+        for surface in surfaces[surface_key]:
+            if 'Multiplier' not in surface.fieldnames:
+                continue
+            elif int(surface.Multiplier) == 1:
+                continue
+            else:
+                logging.warning(f"'{surface.Name}' has a surface multiplier of {surface.Multiplier}")
+                multiplied_surfaces_to_add[surface_key].extend(np.repeat(surface, surface.Multiplier - 1).tolist())
+
+    return multiplied_surfaces_to_add
+
+
+def get_zone_multipliers(idf):
+    """Checks for any zone multipliers greater than 1 in the model.
+
+    Assesses if there are zone multipliers, and returns a dict containing
+    all zones with a multiplier greater than one. For example:
+        {'zone_name': zone_multiplier}
+        {'M Corridor ZN Thermal Zone': 14,
+         'M N1 Apartment ZN Thermal Zone': 14,
+         'M N2 Apartment ZN Thermal Zone': 14}
+    Args:
+        idf (file):
+            The idf file to scan.
+
+    Raises:
+        an: DESCRIPTION.
+
+    Returns:
+        zone_multipliers (dict): A dict of multipliers > 1.
+    """
+    zone_multipliers = {}
+
+    zones = idf.idfobjects['ZONE']
+    if not zones:
+        # TODO(cbreton026): It may be better to raise an error if there are no zones?
+        logging.warning(f"Empty list: BuildME recognizes no zones in the idf for this IDF: {idf.idfname}.")
+
+    for zone in zones:
+        if zone.Multiplier != '' and zone.Multiplier != 1:
+            zone_multipliers[zone.Name] = zone.Multiplier
+
+    return zone_multipliers
+
+
+def apply_zone_multipliers(zone_multipliers, surfaces):
+    """Returns missing surfaces for all zone multipliers greater than 1 in the model.
+
+
+    Args:
+        zone_multipliers (dict):
+            A dictionary containing zone names and zone multipliers. See
+            get_zone_multipliers().
+
+        surfaces (dict):
+            A dictionary of surfaces in the idf file, where the key is the
+            surface type, and the value is a list of surface objects. For example:
+                {'ext_wall': [EpBunch, EpBunch],
+                 'slab: [SurrogateElement],
+                 'int_wall: [EpBunch, EpBunch]'}
+
+    Returns:
+        multiplied_surfaces_to_add (dict):
+            a dict of multiplied surfaces that must be added to 'surfaces'.
+
+    """
+    multiplied_surfaces_to_add = {}
+
+    for surface_key in surfaces:
+        multiplied_surface = []
+        if not surfaces[surface_key]:
+            logging.warning("surface %s is empty - skipping it" % surface_key)
+            continue
+
+        for surface in surfaces[surface_key]:
+            # Get each surface's zone name.
+            try:
+                if 'Building_Surface_Name' in surface.fieldnames:
+                    # FIXME(cbreton026): this works, but only for windows in 'ext_wall'.
+                    # Find a more general approach, e.g. by looking in BuildingSurface:Detailed earlier.
+                    zone_name = [item.Zone_Name for item in surfaces['ext_wall'] if item.Name == surface.Building_Surface_Name][0]
+                    # [item.Zone_Name for item in idf.idfobjects['BuildingSurface:Detailed'] if item.Name == surface.Building_Surface_Name] more general - do earlier?
+                    # [item.Zone_Name for item in idf_RT.idfobjects['BuildingSurface:Detailed'] if item.Name == 't WWall SWA']
+
+                elif 'Zone_Name' in surface.fieldnames:
+                    zone_name = surface.Zone_Name
+                else:
+                    # TODO(cbreton026): Possibly rework into a try/except or getattr()?
+                    # https://stackoverflow.com/questions/610883/how-to-know-if-an-object-has-an-attribute-in-python
+                    logging.warning("Unrecognized zone name; Zone_Name and Building_Surface_Name absent from fieldnames")  # TODO: Possible use an assert
+            except AttributeError as err:
+                logging.warning(f"The {err}. '{surface.Name}' is a {type(surface)}"
+                                "and is not supported by apply_zone_multipliers()")
+
+            # print(zone_name, surface.Name)
+            if zone_name in zone_multipliers:
+                logging.debug(f"multiplying surfaces for {zone_name}")
+                multiplied_surface.extend(np.repeat(surface, zone_multipliers[zone_name] - 1).tolist())
+
+        # surfaces_including_multipliers[surface_key].extend(multiplied_surface)
+        multiplied_surfaces_to_add[surface_key] = multiplied_surface
+
+    return multiplied_surfaces_to_add
+
+
+def add_surrogate_elem(idf, surfaces, energy_standard, res_scenario):
+    surrogate_elems = defaultdict(list)
+
+    surface_areas = calc_surface_areas(surfaces)
+    # TODO(cbreton026): gettint this I/O outside the loop would improve performance
+    constr_dict = {m.Name: m for m in read_constructions(idf)}
+
+    surrogate_list = [''.join(['attic-ceiling-', energy_standard]),
+                      ''.join(['Surrogate_slab-', res_scenario]),
+                      ''.join(['Concrete_floor_slab-', res_scenario]),
+                      ''.join(['Shear_wall-', res_scenario])
+                      ]
+
+    # Check is the IDF is RT - it doesn't fit with the general form (yet - # FIXME(cbreton026))
+    is_RT = 'RT.idf' in idf.idfname
+
+    for elem in surrogate_list:
+        if elem not in constr_dict.keys():
+            continue
+
+        # TODO(cbreton026): In python 3.10 this could be replaced by a match-case
+        if 'attic-ceiling-' in elem:
+            logging.warning(f"Adding {elem} to interior walls...")
+            surrogate_elems['int_wall'].extend(
+                create_surrogate_int_walls(surface_areas['floor_area_wo_basement'], elem)
+            )
+
+        elif 'Surrogate_slab-' in elem:
+            if is_RT is True:
+                # TODO(cbreton026): get_surface_with_zone_multipliers() adds two
+                # slabs (slab, slab1) and basements (basement, basement1) to the model,
+                # but this seems abitrary / specific to the model. This should be
+                # generalized, but I'm not sure how to do it (yet).
+                # Possibly use a dict? A multiplier?
+                logging.warning(f"Adding {elem} to basement...")
+                surrogate_elems['slab'].extend(
+                    create_surrogate_slab(surface_areas['footprint_area'], elem))
+                surrogate_elems['slab1'].extend(
+                    create_surrogate_slab(surface_areas['footprint_area'], elem))
+                surrogate_elems['basement'].extend(
+                    create_surrogate_basement(surface_areas['footprint_area'], elem))
+                surrogate_elems['basement1'].extend(
+                    create_surrogate_basement(surface_areas['footprint_area'], elem))
+            else:
+                logging.warning(f"Adding {elem} to basement...")
+                surrogate_elems['slab'].extend(
+                    create_surrogate_slab(surface_areas['footprint_area'], elem)
+                )
+                surrogate_elems['basement'].extend(
+                    create_surrogate_basement(surface_areas['footprint_area'], elem)
+                )
+
+        elif 'Concrete_floor_slab-' in elem:
+            if is_RT is True:
+                # TODO(cbreton026): get_surface_with_zone_multipliers() adds two
+                # slabs (slab, slab1) and basements (basement, basement1) to the model,
+                # but this seems abitrary / specific to the model. This should be
+                # generalized, but I'm not sure how to do it (yet).
+                # Possibly use a dict? A multiplier? Where would it be added?
+                logging.warning(f"Adding {elem} to basement...")
+                surrogate_elems['int_floor_second_floor'].extend(
+                    create_surrogate_slab(surface_areas['footprint_area'], elem))
+            else:
+                # FIXME(cbreton026): would it still be added to int_floor_second_floor?
+                logging.warning(f"Adding {elem} to basement...")
+                surrogate_elems['int_floor_second_floor'].extend(
+                    create_surrogate_slab(surface_areas['footprint_area'], elem))
+
+        elif 'Shear_wall-' in elem:
+            logging.warning(f"Adding {elem} to shear walls...")
+            surrogate_elems['shear_wall'].extend(
+                create_surrogate_shear_wall(surface_areas['floor_area_wo_basement'], elem)
+            )
+
+        else:
+            logging.warning(f"'{elem}' is not recognized by BuildME."
+                            "It was not added to the model.")
+
+    return surrogate_elems
